@@ -34,11 +34,13 @@
 // Deterministic: two runs write identical bytes. Runtime ~0.1 s per case.
 //
 // Measured (this session, exact scorer from RULES.txt; after Fugu Max fix
-// — κ=1.18 width, shift cap 2.2, subsample ≤120, fallback <4, output guards):
-//   practice p00+p01 vs reconstructed refresh answers: 0.76 mean loss
-//   (house baselines 1.55; worst scenario 0.83 vs 1.69).
-//   6 synthetic finals (independent generative model): 0.67 mean loss
-//   (house curve 0.86, house persistence 1.36; worst 0.88 vs 1.41).
+// — κ=1.18 width, shift cap 2.2, subsample ≤120, fallback <3, output guards;
+// fallback <4 reverted: single-fix ablation showed the fallback worse than
+// the 3-state window, synth seed 6 0.50→0.91 with <4):
+//   practice p00+p01 vs reconstructed refresh answers: 0.7562 mean loss
+//   (house baselines 1.55; worst scenario 0.8333 vs 1.69).
+//   6 synthetic finals (independent generative model): 0.6082 mean loss
+//   (house curve 0.86, house persistence 1.36; worst 0.7225 vs 1.41).
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -217,12 +219,12 @@ function forecastCase(c: Case): { trophies: Array<{ id: number; q: number[] }> }
     const ys = states.map((s) => (s.rates[i] == null ? null : logit(s.rates[i])));
     const pairsAll = xs.map((x, k) => [x, ys[k], k] as [number, number | null, number]).filter(([, y]) => y !== null);
     // Trend window: only states from the last WINDOW_HOURS feed the fit,
-    // falling back to all states when the window holds fewer than 4.
+    // falling back to all states when the window holds fewer than 3.
     let pairs = pairsAll;
     if (pairsAll.length >= 3) {
       const tCut = Date.parse(c.at) - WINDOW_HOURS * 3600000;
       const w = pairsAll.filter(([, , k]) => Date.parse(states[k].at) >= tCut);
-      if (w.length >= 4) pairs = w;
+      if (w.length >= 3) pairs = w;
     }
     const fx = pairs.map(([x]) => x);
     const fy = pairs.map(([, y]) => y as number);
