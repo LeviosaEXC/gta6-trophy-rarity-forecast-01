@@ -33,11 +33,12 @@
 // frozen reads between refreshes). No network, no randomness, stdlib only.
 // Deterministic: two runs write identical bytes. Runtime ~0.1 s per case.
 //
-// Measured (this session, exact scorer from RULES.txt):
-//   practice p00+p01 vs reconstructed refresh answers: 0.77 mean loss
-//   (house baselines 1.55; worst scenario 0.85 vs 1.69).
-//   6 synthetic finals (independent generative model): 0.60 mean loss
-//   (house curve 0.86, house persistence 1.36; worst 0.71 vs 1.41).
+// Measured (this session, exact scorer from RULES.txt; after Fugu Max fix
+// — κ=1.18 width, shift cap 2.2, subsample ≤120, fallback <4, output guards):
+//   practice p00+p01 vs reconstructed refresh answers: 0.76 mean loss
+//   (house baselines 1.55; worst scenario 0.83 vs 1.69).
+//   6 synthetic finals (independent generative model): 0.67 mean loss
+//   (house curve 0.86, house persistence 1.36; worst 0.88 vs 1.41).
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -57,6 +58,10 @@ const WINDOW_HOURS = 24;
 const BLEND = 0.75;
 /** Surprise log-drop of an unseen refresh, in logits (prior). */
 const DROP_PRIOR = 1.0;
+/** Width widening factor from Fugu Max review §7 (σ 2.42 → 2.85). */
+const KAPPA = 1.18;
+/** Cap on the |center shift| from persistence, in logits (review §6.3.5). */
+const MAX_SHIFT = 2.2;
 
 interface Trophy {
   id: number;
@@ -85,6 +90,7 @@ interface State {
   key: string;
 }
 
+/** Clamp mirrors the scorer (RULES.txt): x is clamped to 0.01 to 99.99 before logit. */
 const clamp = (x: number): number => Math.min(99.99, Math.max(0.01, x));
 const logit = (pct: number): number => Math.log(clamp(pct) / (100 - clamp(pct)));
 const invLogit = (l: number): number => 100 / (1 + Math.exp(-l));
@@ -115,9 +121,19 @@ function theilSen(xs: number[], ys: number[]): { a: number; b: number } {
       if (Math.abs(xs[j] - xs[i]) > 1e-9) slopes.push((ys[j] - ys[i]) / (xs[j] - xs[i]));
     }
   }
-  const b = slopes.length ? median(slopes) : 0;
+  // Slope units are logit per ln-hour; 20 is far above any plausible real
+  // slope and kills the ~507-slope pathology (review §6.3.3).
+  const b = slopes.length ? Math.min(20, Math.max(-20, median(slopes))) : 0;
   const a = median(ys.map((y, i) => y - b * xs[i]));
   return { a, b };
+}
+
+/** Cap state count for Theil-Sen O(n^2): keep at most 120, evenly spaced, always the newest. */
+function subsampleStates(states: State[]): State[] {
+  if (states.length <= 120) return states;
+  const keep: State[] = [];
+  for (let i = 0; i < 120; i++) keep.push(states[Math.floor((i * (states.length - 1)) / 119)]);
+  return keep;
 }
 
 /**
@@ -156,17 +172,20 @@ function mixtureQuantile(m: number, s: number, P: number, D: number, tau: number
 }
 
 function forecastCase(c: Case): { trophies: Array<{ id: number; q: number[] }> } {
-  const states = statesOf(c);
+  const states = subsampleStates(statesOf(c));
   if (states.length === 0) throw new Error('case has no history');
   // Time base: the release day's midnight; fall back to the first read's
   // day when the case omits the release date (defensive; the schema has it).
   const releaseDay = c.game.release_date ?? states[0].at.slice(0, 10);
-  const release = new Date(`${releaseDay}T00:00:00Z`).getTime();
+  let release = new Date(`${releaseDay}T00:00:00Z`).getTime();
+  if (!Number.isFinite(release)) release = new Date(`${states[0].at.slice(0, 10)}T00:00:00Z`).getTime();
   const xOf = (iso: string): number => Math.log(1 + Math.max(0, (new Date(iso).getTime() - release) / 3600000));
   const xs = states.map((s) => xOf(s.at));
-  const xT = xOf(c.target);
-  const horizonDays = c.horizon_minutes / 1440;
-  const horizonHours = c.horizon_minutes / 60;
+  const targetMs = Date.parse(c.target);
+  const xT = Number.isFinite(targetMs) ? xOf(c.target) : xs[xs.length - 1];
+  const horizonMinutes = Number.isFinite(c.horizon_minutes) ? c.horizon_minutes : 0;
+  const horizonDays = Math.min(30, Math.max(0, horizonMinutes / 1440));
+  const horizonHours = Math.min(720, Math.max(0, horizonMinutes / 60));
   const dx = xT - xs[xs.length - 1];
 
   // Refresh hazard: how often the page refreshes, and the chance at least
@@ -198,12 +217,12 @@ function forecastCase(c: Case): { trophies: Array<{ id: number; q: number[] }> }
     const ys = states.map((s) => (s.rates[i] == null ? null : logit(s.rates[i])));
     const pairsAll = xs.map((x, k) => [x, ys[k], k] as [number, number | null, number]).filter(([, y]) => y !== null);
     // Trend window: only states from the last WINDOW_HOURS feed the fit,
-    // falling back to all states when the window holds fewer than 3.
+    // falling back to all states when the window holds fewer than 4.
     let pairs = pairsAll;
     if (pairsAll.length >= 3) {
       const tCut = Date.parse(c.at) - WINDOW_HOURS * 3600000;
       const w = pairsAll.filter(([, , k]) => Date.parse(states[k].at) >= tCut);
-      if (w.length >= 3) pairs = w;
+      if (w.length >= 4) pairs = w;
     }
     const fx = pairs.map(([x]) => x);
     const fy = pairs.map(([, y]) => y as number);
@@ -211,7 +230,8 @@ function forecastCase(c: Case): { trophies: Array<{ id: number; q: number[] }> }
     const medRaw = a + b * xT;
     // Damp the trend move toward persistence (saturation guard).
     const lastRate = lastState.rates[i] == null ? 0 : lastState.rates[i] as number;
-    const med = logit(lastRate) + BLEND * (medRaw - logit(lastRate));
+    const shift = BLEND * (medRaw - logit(lastRate));
+    const med = logit(lastRate) + Math.min(MAX_SHIFT, Math.max(-MAX_SHIFT, shift));
     // Trend uncertainty: residual-based when identified, prior otherwise.
     let sigmaTrend: number;
     if (fy.length >= 3) {
@@ -225,14 +245,18 @@ function forecastCase(c: Case): { trophies: Array<{ id: number; q: number[] }> }
     } else {
       sigmaTrend = 0.5 * Math.abs(dx) + 0.15; // slope unidentified: prior
     }
-    const sigma = Math.max(0.08, Math.sqrt(sigmaTrend ** 2 + sigmaRW ** 2));
+    const sigma = Math.max(0.08, KAPPA * Math.sqrt(sigmaTrend ** 2 + sigmaRW ** 2));
     const od = ownDrop(i);
     const D = od === null ? DROP_PRIOR : Math.min(1.5, Math.max(-0.5, od));
-    const q = LEVELS.map((tau) => {
+    let q = LEVELS.map((tau) => {
       const l = mixtureQuantile(med, sigma, P, D, tau);
       return round4(clamp(invLogit(l)));
     });
     for (let j = 1; j < q.length; j++) q[j] = Math.max(q[j], q[j - 1]);
+    if (q.some((v) => !Number.isFinite(v))) {
+      const r = round4(clamp(lastRate));
+      q = [r, r, r, r, r];
+    }
     return { id: t.id, q };
   });
   return { trophies: rows };
